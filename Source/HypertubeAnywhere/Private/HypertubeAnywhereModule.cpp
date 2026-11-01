@@ -1,6 +1,7 @@
 #include "HypertubeAnywhereModule.h"
 
 #include "HypertubeAnywhereTravel.h"
+#include "Buildables/FGPipeHyperStart.h"
 #include "Engine/AssetManager.h"
 #include "EnhancedPlayerInput.h"
 #include "FGCharacterPlayer.h"
@@ -8,6 +9,12 @@
 #include "InputAction.h"
 #include "Input/FGChildInputMappingContext.h"
 #include "Patching/NativeHookManager.h"
+
+#if PLATFORM_WINDOWS
+#include "Windows/WindowsHWrapper.h"
+#else
+#include <dlfcn.h>
+#endif
 
 DEFINE_LOG_CATEGORY_STATIC(LogHypertubeAnywhereInput, Log, All);
 
@@ -45,6 +52,77 @@ namespace HypertubeAnywhere
 				InputContentPath, UFGChildInputMappingContext::StaticClass(), false);
 			UE_LOG(LogHypertubeAnywhereInput, Display, TEXT("Registered %d child input context(s) from %s"), NumFound, InputContentPath);
 		}));
+	}
+
+	// Entrances only run (and draw full power) while a player is this close (cm). Far enough
+	// that the entrance has spun up before anyone reaches it.
+	constexpr float EntranceActiveRange = 2000.0f;
+
+	bool IsAnyPlayerNear(const AActor* Entrance)
+	{
+		const UWorld* World = Entrance->GetWorld();
+		if (World == nullptr)
+		{
+			return false;
+		}
+
+		const FVector EntranceLocation = Entrance->GetActorLocation();
+		for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+		{
+			const APawn* Pawn = It->IsValid() ? (*It)->GetPawn() : nullptr;
+			if (Pawn != nullptr && FVector::DistSquared(Pawn->GetActorLocation(), EntranceLocation) <= FMath::Square(EntranceActiveRange))
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	using FCanProduceFn = bool (*)(const AFGPipeHyperStart*);
+	FCanProduceFn OriginalCanProduce = nullptr;
+
+	bool CanProduceHook(const AFGPipeHyperStart* Self)
+	{
+		return IsAnyPlayerNear(Self) && OriginalCanProduce(Self);
+	}
+
+	// SUBSCRIBE_UOBJECT_METHOD resolves virtuals through the vtable slot our headers compile to.
+	// For CanProduce_Implementation that slot is wrong in the shipping game: it hooked
+	// AFGBuildableFactory::GetIdlePowerConsumption instead. Look up the exported function itself,
+	// in whichever module holds AFGPipeHyperStart's vtable (Steam, EGS or server build).
+	void* FindCanProduceImplementation()
+	{
+		const void* VTable = *reinterpret_cast<void* const*>(GetDefault<AFGPipeHyperStart>());
+#if PLATFORM_WINDOWS
+		HMODULE GameModule = nullptr;
+		if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			static_cast<LPCWSTR>(VTable), &GameModule))
+		{
+			return nullptr;
+		}
+		return reinterpret_cast<void*>(GetProcAddress(GameModule, "?CanProduce_Implementation@AFGPipeHyperStart@@UEBA_NXZ"));
+#else
+		Dl_info Info;
+		void* GameModule = dladdr(VTable, &Info) != 0 ? dlopen(Info.dli_fname, RTLD_NOW | RTLD_NOLOAD) : nullptr;
+		return GameModule != nullptr ? dlsym(GameModule, "_ZNK17AFGPipeHyperStart25CanProduce_ImplementationEv") : nullptr;
+#endif
+	}
+
+	// Vanilla entrances "produce", and so draw full power, whenever they're attached to a tube.
+	// Not producing drops them to the factory idle draw; HasPower comes from the circuit, so
+	// they still work once a player walks up.
+	void HookEntranceCanProduce()
+	{
+		void* Target = FindCanProduceImplementation();
+		if (Target == nullptr)
+		{
+			UE_LOG(LogHypertubeAnywhereInput, Error, TEXT("AFGPipeHyperStart::CanProduce_Implementation not found; entrances keep vanilla power use"));
+			return;
+		}
+
+		FNativeHookManagerInternal::RegisterHookFunction(TEXT("AFGPipeHyperStart::CanProduce_Implementation"),
+			Target, nullptr, 0, reinterpret_cast<void*>(&CanProduceHook), reinterpret_cast<void**>(&OriginalCanProduce));
+		UE_LOG(LogHypertubeAnywhereInput, Display, TEXT("Hooked AFGPipeHyperStart::CanProduce_Implementation at %p"), Target);
 	}
 
 	void HandleInput(AFGCharacterPlayer* Player)
@@ -95,6 +173,8 @@ void FHypertubeAnywhereModule::StartupModule()
 		{
 			HypertubeAnywhere::HandleInput(Self);
 		});
+
+	HypertubeAnywhere::HookEntranceCanProduce();
 
 	UE_LOG(LogHypertubeAnywhereInput, Display, TEXT("Hypertube Anywhere hooks installed"));
 #endif
